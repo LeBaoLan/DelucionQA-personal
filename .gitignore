@@ -1,0 +1,49 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test, coverage, and type-checker caches
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local IDE and editor files
+.vscode/
+.idea/
+*.code-workspace
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime logs and generated Hydra outputs
+*.log
+outputs/
+.hydra/
+
+# Generated crawl/index data
+data/data_for_index/
+
+# Temporary and operating-system files
+*.tmp
+*.temp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
