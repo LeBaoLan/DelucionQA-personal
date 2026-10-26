@@ -38,6 +38,7 @@ outputs/
 
 # Generated crawl/index data
 data/data_for_index/
+*.csv
 
 # Temporary and operating-system files
 *.tmp

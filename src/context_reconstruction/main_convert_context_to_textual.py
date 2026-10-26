@@ -14,6 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 import config.root_path as rp
 
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 def extract_all_text(fileLocation):
 
