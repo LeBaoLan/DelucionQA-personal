@@ -1,4 +1,6 @@
+# run_baselines.py
 from pathlib import Path
+import re
 import pandas as pd
 import numpy as np
 import nltk
@@ -14,13 +16,41 @@ try:
 except Exception:
     EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
+# Danh sách hư từ (stopwords) và từ dẫn dắt câu (framing words) dùng cho Hướng 1
+STOPWORDS = {
+    'a', 'an', 'the', 'and', 'or', 'but', 'if', 'while', 'with', 'to', 'from',
+    'in', 'on', 'at', 'by', 'for', 'of', 'about', 'as', 'into', 'like', 'through',
+    'after', 'over', 'between', 'out', 'against', 'during', 'without', 'before',
+    'under', 'around', 'among', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'shall', 'should',
+    'may', 'might', 'must', 'can', 'could', 'it', 'its', 'they', 'them', 'their',
+    'this', 'that', 'these', 'those', 'you', 'your', 'we', 'our', 'i', 'me', 'my',
+    'he', 'him', 'his', 'she', 'her', 'who', 'which', 'what', 'where', 'when', 'why',
+    'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some',
+    'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+    'just', 'also', 'then', 'there', 'here', 'therefore', 'however', 'thus',
+    'follow', 'following', 'steps', 'step', 'make', 'sure', 'ensure', 'important',
+    'recommended', 'note', 'please', 'refer', 'see', 'take', 'action', 'possible'
+}
+
 
 def clean_ans_sent(s: str) -> str:
-    """Loại bỏ tiền tố 'R1: ', 'R2: ' trong Answer_sent_tokenized."""
+    """Loại bỏ tiền tố 'R1: ', 'R2: ' và số thứ tự đầu câu '1. ', '2. '."""
     if ':' in s[:5]:
-        return s.split(':', 1)[1].strip()
+        s = s.split(':', 1)[1].strip()
+    s = re.sub(r'^\d+\.\s*', '', s)
     return s.strip()
 
+
+def extract_content_tokens(text: str) -> list:
+    """Trích xuất các từ mang nội dung thực (loại bỏ hư từ và dấu câu)."""
+    toks = word_tokenize(text.lower())
+    return [t for t in toks if re.search(r'[a-z0-9]', t) and t not in STOPWORDS and len(t) > 1]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHẦN 1: 3 PHƯƠNG PHÁP BASELINE GỐC CỦA BÀI BÁO
+# ══════════════════════════════════════════════════════════════════════════════
 
 def predict_sim_cosine(answer_sentences: list, context: str, threshold: float) -> str:
     ctx_sents = sent_tokenize(context)
@@ -38,13 +68,6 @@ def predict_sim_cosine(answer_sentences: list, context: str, threshold: float) -
 
 
 def phrase_overlap_ratio(tokens_a: list, tokens_b: list) -> float:
-    """
-    Theo Mục 4.1 (Trang 7) của bài báo:
-    - Bước 1: Quy hoạch động tìm đường đi tối ưu các từ trùng nhau.
-    - Bước 2: Chỉ cộng độ dài các cụm từ trùng liên tiếp (overlapped phrases)
-      có số từ > min(4, 0.3 * len(câu ngắn hơn)) để loại bỏ nhiễu từ từ phổ biến ('the', '.').
-    - Bước 3: Chia tổng số token trùng hợp lệ cho độ dài câu ngắn hơn.
-    """
     m, n = len(tokens_a), len(tokens_b)
     if m == 0 or n == 0:
         return 0.0
@@ -133,10 +156,78 @@ def predict_sim_hybrid(answer_sentences: list, context: str,
     return 'Not Hallucinated'
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PHẦN 2: THUẬT TOÁN NÂNG CẤP (HƯỚNG 1 - MULTI-EVIDENCE & CONTENT GROUNDING)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def predict_improved_dir1(question: str, answer_sentences: list, context: str,
+                          w_cos: float = 0.5, w_cw: float = 0.5,
+                          w_bg: float = 0.2, threshold: float = 0.63) -> str:
+    """
+    Cải tiến Hướng 1 (Multi-Evidence Content Grounding):
+    1. Lọc hư từ (stopwords) và câu dẫn dắt mở đầu lặp lại từ câu hỏi (Question framing).
+    2. Gộp bằng chứng từ Top-3 câu Context liên quan nhất (giải quyết bài toán 1-to-many).
+    3. Kết hợp điểm liên tục giữa:
+       - Semantic Similarity (max_cos)
+       - Top-3 Multi-sentence Content-Word Recall (cw_recall_top3)
+       - Context Bigram Recall (bg_recall)
+    """
+    ctx_sents = sent_tokenize(str(context))
+    ans_sents = [clean_ans_sent(s) for s in answer_sentences]
+    ans_sents = [s for s in ans_sents if len(extract_content_tokens(s)) > 0]
+
+    if not ctx_sents or not ans_sents:
+        return 'Hallucinated'
+
+    ans_embs = EMBED_MODEL.encode(ans_sents, show_progress_bar=False)
+    ctx_embs = EMBED_MODEL.encode(ctx_sents, show_progress_bar=False)
+    sims = cosine_similarity(ans_embs, ctx_embs)
+
+    q_toks = set(extract_content_tokens(str(question)))
+    ctx_all_toks = set(extract_content_tokens(str(context)))
+    ctx_sent_toks = [set(extract_content_tokens(c)) for c in ctx_sents]
+
+    ctx_raw_toks = [t for t in word_tokenize(str(context).lower()) if re.search(r'[a-z0-9]', t)]
+    ctx_bigrams = set(zip(ctx_raw_toks, ctx_raw_toks[1:]))
+    grounded_vocab = ctx_all_toks | q_toks
+
+    for idx, s in enumerate(ans_sents):
+        s_set = set(extract_content_tokens(s))
+
+        # Bỏ qua câu chuyển ý/dẫn dắt rất ngắn (<= 2 từ thực) nếu từ đó nằm trong Câu hỏi/Context
+        cw_recall_ctx_q = sum(1 for t in s_set if t in grounded_vocab) / max(1, len(s_set))
+        if len(s_set) <= 2 and cw_recall_ctx_q >= 0.5:
+            continue
+
+        # 1. Điểm tương đồng ngữ nghĩa cao nhất (Semantic Similarity)
+        max_cos = float(sims[idx].max())
+
+        # 2. Độ phủ từ khóa thực trên Top-3 câu Context liên quan nhất (Multi-sentence Evidence)
+        top3_idx = np.argsort(sims[idx])[-3:]
+        top3_vocab = set().union(*(ctx_sent_toks[j] for j in top3_idx)) | q_toks
+        cw_recall_top3 = sum(1 for t in s_set if t in top3_vocab) / max(1, len(s_set))
+
+        # 3. Độ phủ cụm 2 từ liên tiếp (Bigram Recall)
+        s_raw = [t for t in word_tokenize(s.lower()) if re.search(r'[a-z0-9]', t)]
+        s_bigrams = list(zip(s_raw, s_raw[1:]))
+        bg_recall = sum(1 for bg in s_bigrams if bg in ctx_bigrams) / max(1, len(s_bigrams))
+
+        # Điểm tổng hợp (Combined Grounding Score)
+        score = w_cos * max_cos + w_cw * cw_recall_top3 + w_bg * bg_recall
+        if score <= threshold:
+            return 'Hallucinated'
+
+    return 'Not Hallucinated'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ĐÁNH GIÁ KẾT QUẢ
+# ══════════════════════════════════════════════════════════════════════════════
+
 def evaluate(y_true, y_pred, method_name: str):
-    print(f"\n{'='*60}")
+    print(f"\n{'='*65}")
     print(f"  {method_name}")
-    print('='*60)
+    print('='*65)
     print(classification_report(
         y_true, y_pred,
         target_names=['Not Hallucinated', 'Hallucinated'],
@@ -144,6 +235,7 @@ def evaluate(y_true, y_pred, method_name: str):
     ))
     macro_f1 = f1_score(y_true, y_pred, average='macro') * 100
     print(f"  >>> Macro F1: {macro_f1:.2f}%")
+    return macro_f1
 
 
 if __name__ == '__main__':
@@ -154,14 +246,22 @@ if __name__ == '__main__':
     test['answer_sents'] = test['Answer_sent_tokenized'].apply(literal_eval)
     y_true = (test['Label'] == 'Hallucinated').astype(int).tolist()
 
-    print("\nRunning SIM-COSINE on Test set (T1 = 0.6)...")
+    print("\n1. Running SIM-COSINE Baseline on Test set (T1 = 0.6)...")
     preds_cos = [predict_sim_cosine(r['answer_sents'], r['Context'], 0.6) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_cos], 'SIM-COSINE (Test)')
+    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_cos], 'BASELINE 1: SIM-COSINE (Test)')
 
-    print("\nRunning SIM-OVERLAP on Test set (T2 = 0.1)...")
+    print("\n2. Running SIM-OVERLAP Baseline on Test set (T2 = 0.1)...")
     preds_ov = [predict_sim_overlap(r['answer_sents'], r['Context'], 0.1) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_ov], 'SIM-OVERLAP (Test)')
+    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_ov], 'BASELINE 2: SIM-OVERLAP (Test)')
 
-    print("\nRunning SIM-HYBRID on Test set (T1 = 0.9, T2 = 0.1)...")
+    print("\n3. Running SIM-HYBRID Baseline on Test set (T1 = 0.9, T2 = 0.1)...")
     preds_hyb = [predict_sim_hybrid(r['answer_sents'], r['Context'], 0.9, 0.1) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_hyb], 'SIM-HYBRID (Test)')
+    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_hyb], 'BASELINE 3: SIM-HYBRID (Test)')
+
+    print("\n4. Running IMPROVED DIRECTION 1 (Multi-Evidence & Content Grounding)...")
+    preds_dir1 = [
+        predict_improved_dir1(r['Question'], r['answer_sents'], r['Context'])
+        for _, r in test.iterrows()
+    ]
+    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_dir1],
+             'IMPROVED (HƯỚNG 1): MULTI-EVIDENCE CONTENT GROUNDING (Test)')

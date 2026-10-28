@@ -141,7 +141,3 @@ which are licensed under [Creative Commons Attribution 4.0 International License
 ## Contact
 
 Please contact us at zhengyu.zhou2@bosch.com, msadat3@uic.edu, sadat.mobashir@gmail.com with any questions.
-
-
-dự án: cài lại, phát triển
-đồ án: phát triển hẳn đầy đủ, không nhất thiết là tool
