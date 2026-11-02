@@ -1,29 +1,18 @@
 # run_baselines.py
-from pathlib import Path
+import argparse
+import pickle
 import re
-import pandas as pd
-import numpy as np
-import scipy.special
-import nltk
 from ast import literal_eval
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import scipy.special
 from nltk.tokenize import sent_tokenize, word_tokenize
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sklearn.metrics import classification_report, f1_score
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import f1_score, classification_report
 
-print("Loading Bi-Encoder embedding model (all-MiniLM-L6-v2)...")
-try:
-    EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-except Exception:
-    EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-
-print("Loading NLI Cross-Encoder model (cross-encoder/nli-MiniLM2-L6-H768)...")
-try:
-    NLI_MODEL = CrossEncoder('cross-encoder/nli-MiniLM2-L6-H768', local_files_only=True)
-except Exception:
-    NLI_MODEL = CrossEncoder('cross-encoder/nli-MiniLM2-L6-H768')
-
-# Danh sách hư từ (stopwords) và từ dẫn dắt câu (framing words) dùng cho Hướng 1 & Hướng 2
+# Danh sách hư từ (stopwords) và từ dẫn nhập dùng cho Hướng 1 & Hướng 2
 STOPWORDS = {
     'a', 'an', 'the', 'and', 'or', 'but', 'if', 'while', 'with', 'to', 'from',
     'in', 'on', 'at', 'by', 'for', 'of', 'about', 'as', 'into', 'like', 'through',
@@ -38,50 +27,103 @@ STOPWORDS = {
     'just', 'also', 'then', 'there', 'here', 'therefore', 'however', 'thus',
     'follow', 'following', 'steps', 'step', 'make', 'sure', 'ensure', 'important',
     'recommended', 'note', 'please', 'refer', 'see', 'take', 'action', 'possible',
-    # Bổ sung xử lý lỗi FP-1 (câu dẫn nhập liệt kê nhắc tới ngữ cảnh/danh sách)
     'mentioned', 'context', 'provided', 'below', 'above'
 }
 
+_EMBED_MODEL = None
+_NLI_MODEL = None
 
-def clean_ans_sent(s: str) -> str:
-    """Loại bỏ tiền tố 'R1: ', 'R2: ' và số thứ tự đầu câu '1. ', '2. ' (dùng cho Baseline gốc)."""
+
+def get_embed_model():
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        print("Loading Bi-Encoder embedding model (all-MiniLM-L6-v2)...")
+        try:
+            _EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
+        except Exception:
+            _EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _EMBED_MODEL
+
+
+def get_nli_model():
+    global _NLI_MODEL
+    if _NLI_MODEL is None:
+        from sentence_transformers import CrossEncoder
+        print("Loading NLI Cross-Encoder model (cross-encoder/nli-MiniLM2-L6-H768)...")
+        try:
+            _NLI_MODEL = CrossEncoder('cross-encoder/nli-MiniLM2-L6-H768', local_files_only=True)
+        except Exception:
+            _NLI_MODEL = CrossEncoder('cross-encoder/nli-MiniLM2-L6-H768')
+    return _NLI_MODEL
+
+
+def clean_ans_sent(s: str, strip_trailing_list_num: bool = False) -> str:
+    """Loại bỏ tiền tố 'R1: ', số thứ tự đầu câu '1. ', và tùy chọn cắt ': 1.' cuối câu (FP-1)."""
     if ':' in s[:5]:
         s = s.split(':', 1)[1].strip()
     s = re.sub(r'^\d+\.\s*', '', s)
-    return s.strip()
-
-
-def clean_ans_sent_improved(s: str) -> str:
-    """Làm sạch câu cho Hướng 1 & 2: loại bỏ thêm số thứ tự danh sách bị dính ở cuối câu ': 1.' (Sửa lỗi FP-1)."""
-    s = clean_ans_sent(s)
-    s = re.sub(r':\s*\d+\.?\s*$', ':', s)
+    if strip_trailing_list_num:
+        s = re.sub(r':\s*\d+\.?\s*$', ':', s)
     return s.strip()
 
 
 def extract_content_tokens(text: str) -> list:
     """Trích xuất các từ mang nội dung thực (loại bỏ hư từ và dấu câu)."""
-    toks = word_tokenize(text.lower())
+    toks = word_tokenize(str(text).lower())
     return [t for t in toks if re.search(r'[a-z0-9]', t) and t not in STOPWORDS and len(t) > 1]
 
 
+def load_or_compute_embeddings(df: pd.DataFrame, cache_path: Path) -> list:
+    """Tính sẵn (và lưu cache) ma trận Cosine Similarity một lần duy nhất cho mọi phương pháp."""
+    if cache_path.exists():
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+
+    model = get_embed_model()
+    print("Computing sentence embeddings once for all methods (cached for next runs)...")
+    cached_rows = []
+    for _, row in df.iterrows():
+        ctx = str(row['Context'])
+        ctx_sents = sent_tokenize(ctx)
+        ans_base = [clean_ans_sent(s, False) for s in row['answer_sents']]
+        ans_clean = [clean_ans_sent(s, True) for s in row['answer_sents']]
+        ans_filtered = [s for s in ans_clean if len(extract_content_tokens(s)) > 0]
+
+        if not ctx_sents or not ans_base:
+            cached_rows.append(None)
+            continue
+
+        ctx_embs = model.encode(ctx_sents, show_progress_bar=False)
+        ans_embs_base = model.encode(ans_base, show_progress_bar=False)
+        sims_base = cosine_similarity(ans_embs_base, ctx_embs)
+
+        if ans_filtered == ans_base:
+            sims_filtered = sims_base
+        elif ans_filtered:
+            ans_embs_filt = model.encode(ans_filtered, show_progress_bar=False)
+            sims_filtered = cosine_similarity(ans_embs_filt, ctx_embs)
+        else:
+            sims_filtered = np.empty((0, len(ctx_sents)))
+
+        cached_rows.append({
+            'question': str(row['Question']),
+            'context': ctx,
+            'ctx_sents': ctx_sents,
+            'ans_base': ans_base,
+            'ans_filtered': ans_filtered,
+            'sims_base': sims_base,
+            'sims_filtered': sims_filtered,
+        })
+
+    with open(cache_path, 'wb') as f:
+        pickle.dump(cached_rows, f)
+    return cached_rows
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# PHẦN 1: 3 PHƯƠNG PHÁP BASELINE GỐC CỦA BÀI BÁO
+# PHẦN 1: 3 PHƯƠNG PHÁP BASELINE CỦA BÀI BÁO
 # ══════════════════════════════════════════════════════════════════════════════
-
-def predict_sim_cosine(answer_sentences: list, context: str, threshold: float) -> str:
-    ctx_sents = sent_tokenize(context)
-    if not ctx_sents:
-        return 'Hallucinated'
-
-    ans_sents = [clean_ans_sent(s) for s in answer_sentences]
-    ans_embs = EMBED_MODEL.encode(ans_sents, show_progress_bar=False)
-    ctx_embs = EMBED_MODEL.encode(ctx_sents, show_progress_bar=False)
-
-    sims = cosine_similarity(ans_embs, ctx_embs)
-    if (sims.max(axis=1) <= threshold).any():
-        return 'Hallucinated'
-    return 'Not Hallucinated'
-
 
 def phrase_overlap_ratio(tokens_a: list, tokens_b: list) -> float:
     m, n = len(tokens_a), len(tokens_b)
@@ -94,15 +136,12 @@ def phrase_overlap_ratio(tokens_a: list, tokens_b: list) -> float:
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
         ta = tokens_a[i - 1]
-        row = dp[i]
-        prev_row = dp[i - 1]
+        row, prev_row = dp[i], dp[i - 1]
         for j in range(1, n + 1):
             if ta == tokens_b[j - 1]:
                 row[j] = prev_row[j - 1] + 1
             else:
-                v1 = prev_row[j]
-                v2 = row[j - 1]
-                row[j] = v1 if v1 >= v2 else v2
+                row[j] = prev_row[j] if prev_row[j] >= row[j - 1] else row[j - 1]
 
     matched_pairs = []
     i, j = m, n
@@ -120,12 +159,10 @@ def phrase_overlap_ratio(tokens_a: list, tokens_b: list) -> float:
     if not matched_pairs:
         return 0.0
 
-    overlap_len = 0
-    cur_len = 1
+    overlap_len, cur_len = 0, 1
     for k in range(1, len(matched_pairs)):
-        di = matched_pairs[k][0] - matched_pairs[k - 1][0]
-        dj = matched_pairs[k][1] - matched_pairs[k - 1][1]
-        if di == 1 and dj == 1:
+        if (matched_pairs[k][0] - matched_pairs[k - 1][0] == 1 and
+                matched_pairs[k][1] - matched_pairs[k - 1][1] == 1):
             cur_len += 1
         else:
             if cur_len > min_phrase_len:
@@ -137,87 +174,87 @@ def phrase_overlap_ratio(tokens_a: list, tokens_b: list) -> float:
     return overlap_len / shorter
 
 
-def predict_sim_overlap(answer_sentences: list, context: str, threshold: float) -> str:
-    ctx_sents = sent_tokenize(context)
-    if not ctx_sents:
-        return 'Hallucinated'
-
-    ctx_tok_list = [word_tokenize(c.lower()) for c in ctx_sents]
-    for s in answer_sentences:
-        ans_tokens = word_tokenize(clean_ans_sent(s).lower())
-        max_ov = max(phrase_overlap_ratio(ans_tokens, ct) for ct in ctx_tok_list)
-        if max_ov <= threshold:
-            return 'Hallucinated'
-    return 'Not Hallucinated'
+def predict_sim_cosine_batch(cached_rows: list, threshold: float = 0.6) -> list:
+    preds = []
+    for item in cached_rows:
+        if item is None or (item['sims_base'].max(axis=1) <= threshold).any():
+            preds.append('Hallucinated')
+        else:
+            preds.append('Not Hallucinated')
+    return preds
 
 
-def predict_sim_hybrid(answer_sentences: list, context: str,
-                       t_cosine: float, t_overlap: float) -> str:
-    ctx_sents = sent_tokenize(context)
-    if not ctx_sents:
-        return 'Hallucinated'
+def predict_sim_overlap_batch(cached_rows: list, threshold: float = 0.1) -> list:
+    preds = []
+    for item in cached_rows:
+        if item is None:
+            preds.append('Hallucinated')
+            continue
+        ctx_tok_list = [word_tokenize(c.lower()) for c in item['ctx_sents']]
+        hal = False
+        for s in item['ans_base']:
+            ans_tokens = word_tokenize(s.lower())
+            if max(phrase_overlap_ratio(ans_tokens, ct) for ct in ctx_tok_list) <= threshold:
+                hal = True
+                break
+        preds.append('Hallucinated' if hal else 'Not Hallucinated')
+    return preds
 
-    ans_sents = [clean_ans_sent(s) for s in answer_sentences]
-    ans_embs = EMBED_MODEL.encode(ans_sents, show_progress_bar=False)
-    ctx_embs = EMBED_MODEL.encode(ctx_sents, show_progress_bar=False)
-    sims = cosine_similarity(ans_embs, ctx_embs)
-    ctx_tok_list = [word_tokenize(c.lower()) for c in ctx_sents]
 
-    for idx, s in enumerate(ans_sents):
-        cosine_ok = sims[idx].max() > t_cosine
-        ans_tokens = word_tokenize(s.lower())
-        overlap_ok = max(phrase_overlap_ratio(ans_tokens, ct) for ct in ctx_tok_list) > t_overlap
-        if not (cosine_ok or overlap_ok):
-            return 'Hallucinated'
-    return 'Not Hallucinated'
+def predict_sim_hybrid_batch(cached_rows: list, t_cosine: float = 0.9, t_overlap: float = 0.1) -> list:
+    preds = []
+    for item in cached_rows:
+        if item is None:
+            preds.append('Hallucinated')
+            continue
+        ctx_tok_list = [word_tokenize(c.lower()) for c in item['ctx_sents']]
+        sims = item['sims_base']
+        hal = False
+        for idx, s in enumerate(item['ans_base']):
+            if sims[idx].max() > t_cosine:
+                continue
+            ans_tokens = word_tokenize(s.lower())
+            if max(phrase_overlap_ratio(ans_tokens, ct) for ct in ctx_tok_list) <= t_overlap:
+                hal = True
+                break
+        preds.append('Hallucinated' if hal else 'Not Hallucinated')
+    return preds
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHẦN 2: THUẬT TOÁN NÂNG CẤP HƯỚNG 1 (MULTI-EVIDENCE & CONTENT GROUNDING)
+# PHẦN 2: HƯỚNG 1 (MULTI-EVIDENCE CONTENT GROUNDING) & HƯỚNG 2 (+ NLI)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def predict_improved_dir1(question: str, answer_sentences: list, context: str,
-                          w_cos: float = 0.5, w_cw: float = 0.5,
-                          w_bg: float = 0.2, threshold: float = 0.63,
-                          q_cov_gate: float = 0.60) -> str:
+def score_row_sentences(item: dict, w_cos: float = 0.5, w_cw: float = 0.5,
+                        w_bg: float = 0.2, q_cov_gate: float = 0.60) -> list:
     """
-    Cải tiến Hướng 1 (Multi-Evidence Content Grounding + Tinh chỉnh FP-1 & FN-1):
-    - Score(R_i) = 0.5 * MaxCosine + 0.5 * Top3_WordRecall + 0.2 * BigramRecall
-    - Sửa lỗi FP-1: Làm sạch số thứ tự danh sách dính cuối câu (': 1.') và lọc từ dẫn nhập ngữ cảnh.
-    - Sửa lỗi FN-1 (Question-Context Coverage Gate): Nếu < 60% từ khóa câu hỏi xuất hiện trong Context
-      (dấu hiệu câu hỏi không liên quan / Answerable=False), chỉ cộng điểm cho các từ câu hỏi thực sự có trong Context.
+    Hàm dùng chung cho cả Hướng 1 và Hướng 2:
+    Tính base_score, câu Top-1, đoạn Top-3 và cờ kiểm tra từ khóa câu hỏi (FN-1) cho từng câu R_i.
     """
-    ctx_sents = sent_tokenize(str(context))
-    ans_sents = [clean_ans_sent_improved(s) for s in answer_sentences]
-    ans_sents = [s for s in ans_sents if len(extract_content_tokens(s)) > 0]
+    q, ctx = item['question'], item['context']
+    ctx_sents, ans_sents, sims = item['ctx_sents'], item['ans_filtered'], item['sims_filtered']
 
-    if not ctx_sents or not ans_sents:
-        return 'Hallucinated'
-
-    ans_embs = EMBED_MODEL.encode(ans_sents, show_progress_bar=False)
-    ctx_embs = EMBED_MODEL.encode(ctx_sents, show_progress_bar=False)
-    sims = cosine_similarity(ans_embs, ctx_embs)
-
-    q_toks = set(extract_content_tokens(str(question)))
-    ctx_all_toks = set(extract_content_tokens(str(context)))
+    q_toks = set(extract_content_tokens(q))
+    ctx_all_toks = set(extract_content_tokens(ctx))
     ctx_sent_toks = [set(extract_content_tokens(c)) for c in ctx_sents]
-
-    ctx_raw_toks = [t for t in word_tokenize(str(context).lower()) if re.search(r'[a-z0-9]', t)]
+    ctx_raw_toks = [t for t in word_tokenize(ctx.lower()) if re.search(r'[a-z0-9]', t)]
     ctx_bigrams = set(zip(ctx_raw_toks, ctx_raw_toks[1:]))
 
-    # Cổng kiểm soát FN-1: Kiểm tra tỷ lệ từ khóa của Question xuất hiện trong Context
+    # Cổng kiểm soát FN-1: Kiểm tra tỷ lệ từ khóa Question có trong Context
     q_coverage = sum(1 for t in q_toks if t in ctx_all_toks) / max(1, len(q_toks))
+    unverified_q_toks = q_toks - ctx_all_toks
     allowed_q_toks = (q_toks & ctx_all_toks) if q_coverage < q_cov_gate else q_toks
     grounded_vocab = ctx_all_toks | allowed_q_toks
 
+    sent_infos = []
     for idx, s in enumerate(ans_sents):
         s_set = set(extract_content_tokens(s))
-
         cw_recall_ctx_q = sum(1 for t in s_set if t in grounded_vocab) / max(1, len(s_set))
         if len(s_set) <= 2 and cw_recall_ctx_q >= 0.5:
             continue
 
         max_cos = float(sims[idx].max())
+        best_j = int(sims[idx].argmax())
         top3_idx = np.argsort(sims[idx])[-3:]
         top3_vocab = set().union(*(ctx_sent_toks[j] for j in top3_idx)) | allowed_q_toks
         cw_recall_top3 = sum(1 for t in s_set if t in top3_vocab) / max(1, len(s_set))
@@ -226,133 +263,96 @@ def predict_improved_dir1(question: str, answer_sentences: list, context: str,
         s_bigrams = list(zip(s_raw, s_raw[1:]))
         bg_recall = sum(1 for bg in s_bigrams if bg in ctx_bigrams) / max(1, len(s_bigrams))
 
-        score = w_cos * max_cos + w_cw * cw_recall_top3 + w_bg * bg_recall
-        if score <= threshold:
-            return 'Hallucinated'
+        base_score = w_cos * max_cos + w_cw * cw_recall_top3 + w_bg * bg_recall
+        has_unverified_q = (q_coverage < q_cov_gate) and bool(s_set & unverified_q_toks)
+        premise_top1 = ctx_sents[best_j]
+        premise_top3 = " ".join(ctx_sents[j] for j in sorted(top3_idx))
+        sent_infos.append((base_score, premise_top1, premise_top3, s, has_unverified_q))
 
-    return 'Not Hallucinated'
+    return sent_infos
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHẦN 3: THUẬT TOÁN NÂNG CẤP HƯỚNG 2 (NLI CROSS-ENCODER VERIFICATION)
-# ══════════════════════════════════════════════════════════════════════════════
+def predict_multi_evidence_grounding_batch(cached_rows: list, threshold: float = 0.63) -> list:
+    """Phương pháp 4 (Hướng 1): Multi-Evidence Content Grounding."""
+    preds = []
+    for item in cached_rows:
+        if item is None or len(item['ans_filtered']) == 0:
+            preds.append('Hallucinated')
+            continue
+        sent_infos = score_row_sentences(item)
+        hal = any(base_score <= threshold for base_score, _, _, _, _ in sent_infos)
+        preds.append('Hallucinated' if hal else 'Not Hallucinated')
+    return preds
 
-def predict_improved_dir2_batch(df: pd.DataFrame,
-                                w_cos: float = 0.5, w_cw: float = 0.5, w_bg: float = 0.2,
-                                w_ent: float = 0.2, w_con: float = 0.3,
-                                threshold: float = 0.63,
-                                q_cov_gate: float = 0.60) -> list:
-    """
-    Cải tiến Hướng 2 (Multi-Evidence Grounding + Tinh chỉnh FP-1/FN-1 + NLI Cross-Encoder):
-    - Với mỗi câu trả lời R_i, lấy câu Context gần nhất (Top-1) và đoạn gộp 3 câu Context gần nhất (Top-3)
-      đưa vào mô hình Cross-Encoder NLI ('cross-encoder/nli-MiniLM2-L6-H768').
-    - Sửa lỗi FP-1: Làm sạch số thứ tự danh sách dính cuối câu (': 1.') và lọc từ dẫn nhập ngữ cảnh.
-    - Sửa lỗi FN-1: Khi câu hỏi không khớp ngữ cảnh (q_coverage < 0.60), tước quyền cộng điểm miễn phí
-      của các từ khóa câu hỏi không nằm trong Context và chặn NLI cộng điểm Entailment cho câu chứa từ lạ đó.
-    """
-    predictions = ['Not Hallucinated'] * len(df)
-    ambiguous_items = []   # Lưu các câu vùng biên cần NLI phân xử
-    pairs_top1 = []
-    pairs_top3 = []
 
-    for row_idx, (_, row) in enumerate(df.iterrows()):
-        q = str(row['Question'])
-        ctx = str(row['Context'])
-        ans_sents = [clean_ans_sent_improved(s) for s in row['answer_sents']]
-        ans_sents = [s for s in ans_sents if len(extract_content_tokens(s)) > 0]
-        ctx_sents = sent_tokenize(ctx)
+def predict_multi_evidence_nli_batch(cached_rows: list, nli_cache_path: Path = None,
+                                     w_ent: float = 0.2, w_con: float = 0.3,
+                                     threshold: float = 0.63) -> list:
+    """Phương pháp 5 (Hướng 2): Multi-Evidence Content Grounding + NLI Cross-Encoder."""
+    predictions = ['Not Hallucinated'] * len(cached_rows)
+    ambiguous_items, pairs_top1, pairs_top3 = [], [], []
 
-        if not ctx_sents or not ans_sents:
+    for row_idx, item in enumerate(cached_rows):
+        if item is None or len(item['ans_filtered']) == 0:
             predictions[row_idx] = 'Hallucinated'
             continue
 
-        ans_embs = EMBED_MODEL.encode(ans_sents, show_progress_bar=False)
-        ctx_embs = EMBED_MODEL.encode(ctx_sents, show_progress_bar=False)
-        sims = cosine_similarity(ans_embs, ctx_embs)
-
-        q_toks = set(extract_content_tokens(q))
-        ctx_all_toks = set(extract_content_tokens(ctx))
-        ctx_sent_toks = [set(extract_content_tokens(c)) for c in ctx_sents]
-        ctx_raw_toks = [t for t in word_tokenize(ctx.lower()) if re.search(r'[a-z0-9]', t)]
-        ctx_bigrams = set(zip(ctx_raw_toks, ctx_raw_toks[1:]))
-
-        # Cổng kiểm soát FN-1: Kiểm tra tỷ lệ từ khóa của Question xuất hiện trong Context
-        q_coverage = sum(1 for t in q_toks if t in ctx_all_toks) / max(1, len(q_toks))
-        unverified_q_toks = q_toks - ctx_all_toks
-        allowed_q_toks = (q_toks & ctx_all_toks) if q_coverage < q_cov_gate else q_toks
-        grounded_vocab = ctx_all_toks | allowed_q_toks
-
+        sent_infos = score_row_sentences(item)
         row_candidates = []
         definite_hallucinated = False
 
-        for idx, s in enumerate(ans_sents):
-            s_set = set(extract_content_tokens(s))
-            cw_recall_ctx_q = sum(1 for t in s_set if t in grounded_vocab) / max(1, len(s_set))
-            if len(s_set) <= 2 and cw_recall_ctx_q >= 0.5:
-                continue
-
-            max_cos = float(sims[idx].max())
-            best_j = int(sims[idx].argmax())
-            top3_idx = np.argsort(sims[idx])[-3:]
-            top3_vocab = set().union(*(ctx_sent_toks[j] for j in top3_idx)) | allowed_q_toks
-            cw_recall_top3 = sum(1 for t in s_set if t in top3_vocab) / max(1, len(s_set))
-
-            s_raw = [t for t in word_tokenize(s.lower()) if re.search(r'[a-z0-9]', t)]
-            s_bigrams = list(zip(s_raw, s_raw[1:]))
-            bg_recall = sum(1 for bg in s_bigrams if bg in ctx_bigrams) / max(1, len(s_bigrams))
-
-            base_score = w_cos * max_cos + w_cw * cw_recall_top3 + w_bg * bg_recall
-
-            # Kiểm tra xem câu trả lời có đang lặp lại từ khóa không có trong Context của một câu hỏi lạc đề không (FN-1)
-            has_unverified_q = (q_coverage < q_cov_gate) and bool(s_set & unverified_q_toks)
-
-            # 1. Nếu base_score quá thấp -> Chắc chắn Hallucinated!
+        for base_score, p1, p3, s, has_unv_q in sent_infos:
             if base_score + w_ent <= threshold:
                 definite_hallucinated = True
                 break
-
-            # 2. Nếu base_score rất cao -> Chắc chắn Supported!
             if base_score - w_con > threshold:
                 continue
-
-            # 3. Câu nằm ở vùng biên -> Đưa vào danh sách chờ mô hình NLI chấm điểm
-            premise_top1 = ctx_sents[best_j]
-            premise_top3 = " ".join(ctx_sents[j] for j in sorted(top3_idx))
-            row_candidates.append((base_score, premise_top1, premise_top3, s, has_unverified_q))
+            row_candidates.append((base_score, p1, p3, s, has_unv_q))
 
         if definite_hallucinated:
             predictions[row_idx] = 'Hallucinated'
-        elif row_candidates:
+        else:
             for base_score, p1, p3, s, has_unv_q in row_candidates:
                 ambiguous_items.append((row_idx, base_score, has_unv_q))
                 pairs_top1.append((p1, s))
                 pairs_top3.append((p3, s))
 
-    # Chạy batch NLI một lần cho toàn bộ các câu vùng biên
     if ambiguous_items:
-        logits1 = NLI_MODEL.predict(pairs_top1, batch_size=64, show_progress_bar=False)
-        logits3 = NLI_MODEL.predict(pairs_top3, batch_size=64, show_progress_bar=False)
-        probs1 = scipy.special.softmax(logits1, axis=1)
-        probs3 = scipy.special.softmax(logits3, axis=1)
+        nli_cache = {}
+        if nli_cache_path and nli_cache_path.exists():
+            with open(nli_cache_path, 'rb') as f:
+                nli_cache = pickle.load(f)
+
+        missing = [p for p in set(pairs_top1 + pairs_top3) if p not in nli_cache]
+        if missing:
+            nli_model = get_nli_model()
+            logits = nli_model.predict(missing, batch_size=64, show_progress_bar=False)
+            probs = scipy.special.softmax(logits, axis=1)
+            for i, p in enumerate(missing):
+                nli_cache[p] = probs[i]
+            if nli_cache_path:
+                with open(nli_cache_path, 'wb') as f:
+                    pickle.dump(nli_cache, f)
 
         for k, (row_idx, base_score, has_unv_q) in enumerate(ambiguous_items):
             if predictions[row_idx] == 'Hallucinated':
                 continue
-            # Cột 1: Entailment, Cột 0: Contradiction
-            ent = 0.0 if has_unv_q else max(float(probs1[k, 1]), float(probs3[k, 1]))
-            con = min(float(probs1[k, 0]), float(probs3[k, 0]))
-            final_score = base_score + w_ent * ent - w_con * con
-            if final_score <= threshold:
+            pr1 = nli_cache[pairs_top1[k]]
+            pr3 = nli_cache[pairs_top3[k]]
+            ent = 0.0 if has_unv_q else max(float(pr1[1]), float(pr3[1]))
+            con = min(float(pr1[0]), float(pr3[0]))
+            if base_score + w_ent * ent - w_con * con <= threshold:
                 predictions[row_idx] = 'Hallucinated'
 
     return predictions
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ĐÁNH GIÁ KẾT QUẢ
+# ĐÁNH GIÁ KẾT QUẢ & CHẠY THỰC NGHIỆM
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(y_true, y_pred, method_name: str):
+def evaluate(y_true, y_pred_labels: list, method_name: str):
+    y_pred = [1 if p == 'Hallucinated' else 0 for p in y_pred_labels]
     print(f"\n{'='*65}")
     print(f"  {method_name}")
     print('='*65)
@@ -367,34 +367,50 @@ def evaluate(y_true, y_pred, method_name: str):
 
 
 if __name__ == '__main__':
-    base = Path(__file__).parent / 'data' / 'DelucionQA_final'
+    parser = argparse.ArgumentParser(description="Run Hallucination Detection Methods on DelucionQA")
+    parser.add_argument(
+        '--method', type=str, default='all',
+        choices=['all', 'new', 'baselines', '1', '2', '3', '4', '5', 'dir1', 'dir2'],
+        help="Chọn phương pháp muốn chạy: 'all' (tất cả), 'new' (chỉ Hướng 1 & 2), 'dir1', 'dir2', hoặc '1'..'5'"
+    )
+    args = parser.parse_args()
 
+    base = Path(__file__).parent / 'data' / 'DelucionQA_final'
     print("Loading datasets...")
     test = pd.read_csv(base / 'test.csv')
     test['answer_sents'] = test['Answer_sent_tokenized'].apply(literal_eval)
     y_true = (test['Label'] == 'Hallucinated').astype(int).tolist()
 
-    print("\n1. Running SIM-COSINE Baseline on Test set (T1 = 0.6)...")
-    preds_cos = [predict_sim_cosine(r['answer_sents'], r['Context'], 0.6) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_cos], 'BASELINE 1: SIM-COSINE (Test)')
+    cache_file = base / '.emb_cache_test.pkl'
+    nli_cache_file = base / '.nli_cache_test.pkl'
+    cached_test = load_or_compute_embeddings(test, cache_file)
 
-    print("\n2. Running SIM-OVERLAP Baseline on Test set (T2 = 0.1)...")
-    preds_ov = [predict_sim_overlap(r['answer_sents'], r['Context'], 0.1) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_ov], 'BASELINE 2: SIM-OVERLAP (Test)')
+    m = args.method
+    if m in ('all', 'baselines', '1'):
+        print("\n1. Running SIM-COSINE Baseline on Test set (T1 = 0.6)...")
+        evaluate(y_true, predict_sim_cosine_batch(cached_test, 0.6),
+                 'METHOD 1 (BASELINE): SIM-COSINE (Test)')
 
-    print("\n3. Running SIM-HYBRID Baseline on Test set (T1 = 0.9, T2 = 0.1)...")
-    preds_hyb = [predict_sim_hybrid(r['answer_sents'], r['Context'], 0.9, 0.1) for _, r in test.iterrows()]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_hyb], 'BASELINE 3: SIM-HYBRID (Test)')
+    if m in ('all', 'baselines', '2'):
+        print("\n2. Running SIM-OVERLAP Baseline on Test set (T2 = 0.1)...")
+        evaluate(y_true, predict_sim_overlap_batch(cached_test, 0.1),
+                 'METHOD 2 (BASELINE): SIM-OVERLAP (Test)')
 
-    print("\n4. Running IMPROVED DIRECTION 1 (Multi-Evidence & Content Grounding)...")
-    preds_dir1 = [
-        predict_improved_dir1(r['Question'], r['answer_sents'], r['Context'])
-        for _, r in test.iterrows()
-    ]
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_dir1],
-             'IMPROVED (DIRECTION 1): MULTI-EVIDENCE CONTENT GROUNDING (Test)')
+    if m in ('all', 'baselines', '3'):
+        print("\n3. Running SIM-HYBRID Baseline on Test set (T1 = 0.9, T2 = 0.1)...")
+        evaluate(y_true, predict_sim_hybrid_batch(cached_test, 0.9, 0.1),
+                 'METHOD 3 (BASELINE): SIM-HYBRID (Test)')
 
-    print("\n5. Running IMPROVED DIRECTION 2 (+ NLI Cross-Encoder Verification)...")
-    preds_dir2 = predict_improved_dir2_batch(test)
-    evaluate(y_true, [1 if p == 'Hallucinated' else 0 for p in preds_dir2],
-             'IMPROVED (DIRECTION 2): MULTI-EVIDENCE + NLI CROSS-ENCODER (Test)')
+    if m in ('all', 'new', '4', 'dir1'):
+        print("\n4. Running Multi-Evidence Content Grounding (Direction 1)...")
+        evaluate(y_true, predict_multi_evidence_grounding_batch(cached_test),
+                 'METHOD 4 (DIRECTION 1): MULTI-EVIDENCE CONTENT GROUNDING (Test)')
+
+    if m in ('all', 'new', '5', 'dir2'):
+        print("\n5. Running Multi-Evidence Content Grounding + NLI Cross-Encoder (Direction 2)...")
+        evaluate(y_true, predict_multi_evidence_nli_batch(cached_test, nli_cache_file),
+                 'METHOD 5 (DIRECTION 2): MULTI-EVIDENCE GROUNDING + NLI CROSS-ENCODER (Test)')
+
+
+# python run_baselines.py --method new
+#                                  dir1/baselines

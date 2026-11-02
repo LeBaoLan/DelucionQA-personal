@@ -48,3 +48,6 @@ data/data_for_index/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Model and embedding cache files
+*.pkl
