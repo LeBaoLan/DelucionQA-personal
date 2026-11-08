@@ -7,10 +7,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import scipy.special
 from nltk.tokenize import sent_tokenize, word_tokenize
 from sklearn.metrics import classification_report, f1_score
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    """Tính hàm Softmax theo từng dòng bằng NumPy thuần (ổn định số học)."""
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exps = np.exp(shifted)
+    return exps / np.sum(exps, axis=1, keepdims=True)
 
 # Danh sách hư từ (stopwords) và từ dẫn nhập dùng cho Hướng 1 & Hướng 2
 STOPWORDS = {
@@ -323,11 +329,11 @@ def predict_multi_evidence_nli_batch(cached_rows: list, nli_cache_path: Path = N
             with open(nli_cache_path, 'rb') as f:
                 nli_cache = pickle.load(f)
 
-        missing = [p for p in set(pairs_top1 + pairs_top3) if p not in nli_cache]
+        missing = sorted(p for p in set(pairs_top1 + pairs_top3) if p not in nli_cache)
         if missing:
             nli_model = get_nli_model()
-            logits = nli_model.predict(missing, batch_size=64, show_progress_bar=False)
-            probs = scipy.special.softmax(logits, axis=1)
+            logits = nli_model.predict(missing, batch_size=128, show_progress_bar=False)
+            probs = _softmax(logits)
             for i, p in enumerate(missing):
                 nli_cache[p] = probs[i]
             if nli_cache_path:
@@ -358,36 +364,188 @@ CLOSING_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Chỉ số cột của 23 đặc trưng mức câu nhỏ (Sentence-level feature indices)
+COL_MAX_COS          = 0   # Cosine similarity cao nhất với câu trong Context
+COL_TOP3_MEAN_COS    = 1   # Trung bình Cosine với Top-3 câu trong Context
+COL_CW_TOP3          = 2   # Tỷ lệ từ mang nghĩa khớp Top-3 câu Context (+ câu hỏi hợp lệ)
+COL_CW_CTX           = 3   # Tỷ lệ từ mang nghĩa khớp toàn bộ Context
+COL_CW_TOP1          = 4   # Tỷ lệ từ mang nghĩa khớp câu Top-1 Context
+COL_BG_RECALL        = 5   # Tỷ lệ cụm 2 từ (Bigram) khớp Context
+COL_TRI_RECALL       = 6   # Tỷ lệ cụm 3 từ (Trigram) khớp Context
+COL_BASE_SCORE       = 7   # Điểm tổng hợp Hướng 1 (Base score)
+COL_P_ENT_MAX        = 8   # Xác suất NLI Entailment cao nhất (Top-1 / Top-3)
+COL_P_ENT_TOP1       = 9   # Xác suất NLI Entailment với câu Top-1
+COL_P_CON_MIN        = 10  # Xác suất NLI Contradiction thấp nhất (Top-1 / Top-3)
+COL_P_CON_MAX        = 11  # Xác suất NLI Contradiction cao nhất (Top-1 / Top-3)
+COL_DIR2_SCORE       = 12  # Điểm tổng hợp Hướng 2 (sau khi cộng/trừ NLI)
+COL_Q_COV            = 13  # Độ phủ từ khóa câu hỏi trong Context (Question coverage)
+COL_Q_MAX_COS        = 14  # Cosine cao nhất giữa Câu hỏi và Context
+COL_Q_ANS_COS        = 15  # Cosine giữa Câu hỏi và câu trả lời nhỏ R_i
+COL_HAS_UNV_Q        = 16  # Cờ cảnh báo lặp lại từ khóa lạ từ câu hỏi bẫy (FN-1)
+COL_UNV_NUM_RATIO    = 17  # Tỷ lệ con số trong R_i không xuất hiện trong Context
+COL_SENT_LEN         = 18  # Số lượng từ mang nghĩa trong câu R_i
+COL_IS_SHORT_GROUND  = 19  # Cờ câu trả lời ngắn (<= 2 từ khóa) có căn cứ
+COL_REL_POS          = 20  # Vị trí tương đối của câu trong đoạn trả lời (0.0 -> 1.0)
+COL_IS_LAST          = 21  # Cờ câu nằm ở cuối đoạn trả lời
+COL_IS_CLOSING       = 22  # Cờ câu mang mẫu khuyên nhủ / đóng lại lịch sự
 
-def _extract_dir3_split_features(df: pd.DataFrame, model, nli_cache: dict) -> tuple:
+
+def _prepare_dir3_splits_and_nli(dfs: list, base_dir: Path) -> tuple:
+    """
+    Mã hóa theo lô (Batch-encode) toàn bộ các câu duy nhất trên cả 3 tập (Train, Dev, Test)
+    và tự động chạy mô hình NLI Cross-Encoder cho mọi cặp câu nhập nhằng chưa có trong cache.
+    """
+    emb_all_path = base_dir / '.emb_cache_all.pkl'
+    nli_cache_path = base_dir / '.nli_cache_test.pkl'
+
+    if emb_all_path.exists():
+        with open(emb_all_path, 'rb') as f:
+            raw_splits = pickle.load(f)
+        encoded_splits = [
+            [(item, (item['label'] if item is not None else 1)) for item in split_items]
+            for split_items in raw_splits
+        ]
+    else:
+        unique_texts = set()
+        parsed_splits = []
+        for df in dfs:
+            split_rows = []
+            for _, row in df.iterrows():
+                q, ctx = str(row['Question']), str(row['Context'])
+                ctx_sents = sent_tokenize(ctx)
+                raw_sents = literal_eval(row['Answer_sent_tokenized'])
+                s_labels_dict = literal_eval(row['Sentence_labels'])
+
+                ans_clean, ans_s_labels = [], []
+                for raw_s in raw_sents:
+                    r_key = raw_s.split(':', 1)[0].strip()
+                    c_s = clean_ans_sent(raw_s, strip_trailing_list_num=True)
+                    if len(extract_content_tokens(c_s)) > 0:
+                        ans_clean.append(c_s)
+                        lbl = s_labels_dict.get(r_key, 'Supported')
+                        ans_s_labels.append(0 if lbl == 'Supported' else 1)
+
+                y_lbl = 1 if row['Label'] == 'Hallucinated' else 0
+                if not ctx_sents or not ans_clean:
+                    split_rows.append((None, y_lbl))
+                    continue
+
+                unique_texts.add(q)
+                unique_texts.update(ctx_sents)
+                unique_texts.update(ans_clean)
+                split_rows.append(((q, ctx, ctx_sents, ans_clean, ans_s_labels), y_lbl))
+            parsed_splits.append(split_rows)
+
+        unique_list = sorted(unique_texts)
+        print(f"Batch-encoding {len(unique_list)} unique sentences across Train, Dev, Test...")
+        model = get_embed_model()
+        all_vecs = model.encode(unique_list, batch_size=128, show_progress_bar=True, normalize_embeddings=True)
+        text_to_vec = {t: all_vecs[i] for i, t in enumerate(unique_list)}
+
+        encoded_splits, raw_splits = [], []
+        for split_rows in parsed_splits:
+            items, raw_items = [], []
+            for payload, y_lbl in split_rows:
+                if payload is None:
+                    items.append((None, y_lbl))
+                    raw_items.append(None)
+                    continue
+                q, ctx, ctx_sents, ans_clean, ans_s_labels = payload
+                q_vec = text_to_vec[q].reshape(1, -1)
+                ctx_mat = np.array([text_to_vec[c] for c in ctx_sents])
+                ans_mat = np.array([text_to_vec[a] for a in ans_clean])
+
+                sims = ans_mat @ ctx_mat.T
+                q_sims = (q_vec @ ctx_mat.T)[0]
+                q_ans_sims = (q_vec @ ans_mat.T)[0]
+
+                item_dict = {
+                    'question': q,
+                    'context': ctx,
+                    'ctx_sents': ctx_sents,
+                    'ans_filtered': ans_clean,
+                    'sent_y': ans_s_labels,
+                    'sims_filtered': sims,
+                    'q_sims': q_sims,
+                    'q_ans_sims': q_ans_sims,
+                    'label': y_lbl,
+                }
+                items.append((item_dict, y_lbl))
+                raw_items.append(item_dict)
+            encoded_splits.append(items)
+            raw_splits.append(raw_items)
+
+        with open(emb_all_path, 'wb') as f:
+            pickle.dump(tuple(raw_splits), f)
+
+    nli_cache = {}
+    if nli_cache_path.exists():
+        with open(nli_cache_path, 'rb') as f:
+            nli_cache = pickle.load(f)
+
+    # Gom nhóm cặp câu theo thứ tự cố định để kết quả batch-encoding hoàn toàn bất biến
+    m5_group, main_group, ext_group = set(), set(), set()
+    for item, _ in encoded_splits[2]:
+        if item is None:
+            continue
+        for base_score, p1, p3, s, _ in score_row_sentences(item):
+            if base_score + 0.2 <= 0.63:
+                break
+            if base_score - 0.3 > 0.63:
+                continue
+            m5_group.add((p1, s))
+            m5_group.add((p3, s))
+
+    for split_idx, split_items in enumerate(encoded_splits):
+        for item, _ in split_items:
+            if item is None:
+                continue
+            for base_score, p1, p3, s, _ in score_row_sentences(item):
+                if 0.35 < base_score <= 0.95:
+                    main_group.add((p1, s))
+                    main_group.add((p3, s))
+                elif split_idx > 0 and 0.95 < base_score <= 1.15:
+                    ext_group.add((p1, s))
+                    ext_group.add((p3, s))
+
+    pending_batches = [
+        sorted(p for p in m5_group if p not in nli_cache),
+        sorted(p for p in (main_group - m5_group) if p not in nli_cache),
+        sorted(p for p in (ext_group - main_group - m5_group) if p not in nli_cache),
+    ]
+    total_missing = sum(len(b) for b in pending_batches)
+    if total_missing > 0:
+        print(f"Computing NLI Cross-Encoder for {total_missing} missing ambiguous pairs...")
+        nli_model = get_nli_model()
+        for batch_list in pending_batches:
+            if not batch_list:
+                continue
+            logits = nli_model.predict(batch_list, batch_size=128, show_progress_bar=True)
+            probs = _softmax(logits)
+            for i, pair in enumerate(batch_list):
+                nli_cache[pair] = probs[i]
+        with open(nli_cache_path, 'wb') as f:
+            pickle.dump(nli_cache, f)
+
+    return encoded_splits, nli_cache
+
+
+def _extract_dir3_split_features(split_items: list, nli_cache: dict, max_nli_bs: float = 0.95) -> tuple:
     """Trích xuất 23 đặc trưng mức câu (Sentence-level features) cho từng câu nhỏ R_i."""
-    all_X_sent, all_y_sent, row_sent_features, row_ids = [], [], [], []
-    y_row = (df['Label'] == 'Hallucinated').astype(int).to_numpy()
+    all_X_sent, all_y_sent, row_sent_features, row_ids, y_row_list = [], [], [], [], []
 
-    for r_idx, (_, row) in enumerate(df.iterrows()):
-        q, ctx = str(row['Question']), str(row['Context'])
-        ctx_sents = sent_tokenize(ctx)
-        raw_sents = literal_eval(row['Answer_sent_tokenized'])
-        s_labels_dict = literal_eval(row['Sentence_labels'])
-
-        ans_sents, sent_y = [], []
-        for raw_s in raw_sents:
-            r_key = raw_s.split(':', 1)[0].strip()
-            c_s = clean_ans_sent(raw_s, strip_trailing_list_num=True)
-            if len(extract_content_tokens(c_s)) > 0:
-                ans_sents.append(c_s)
-                sent_y.append(0 if s_labels_dict.get(r_key, 'Supported') == 'Supported' else 1)
-
-        if not ctx_sents or not ans_sents:
+    for r_idx, (item, y_lbl) in enumerate(split_items):
+        y_row_list.append(y_lbl)
+        if item is None or len(item['ans_filtered']) == 0:
             row_sent_features.append(None)
             continue
 
-        q_emb = model.encode([q], show_progress_bar=False)
-        ctx_embs = model.encode(ctx_sents, show_progress_bar=False)
-        ans_embs = model.encode(ans_sents, show_progress_bar=False)
-        sims = cosine_similarity(ans_embs, ctx_embs)
-        q_sims = cosine_similarity(q_emb, ctx_embs)[0]
-        q_ans_sims = cosine_similarity(q_emb, ans_embs)[0]
+        q, ctx = item['question'], item['context']
+        ctx_sents, ans_sents = item['ctx_sents'], item['ans_filtered']
+        sims = item['sims_filtered']
+        q_sims = item['q_sims']
+        q_ans_sims = item['q_ans_sims']
+        sent_y = item['sent_y']
 
         q_toks = set(extract_content_tokens(q))
         ctx_all_toks = set(extract_content_tokens(ctx))
@@ -427,15 +585,17 @@ def _extract_dir3_split_features(df: pd.DataFrame, model, nli_cache: dict) -> tu
             s_trigrams = list(zip(s_raw, s_raw[1:], s_raw[2:]))
             tri_recall = sum(1 for tg in s_trigrams if tg in ctx_trigrams) / max(1, len(s_trigrams))
 
-            base_score = 0.5 * max_cos + 0.5 * cw_recall_top3 + 0.2 * bg_recall
-            if is_short_grounded > 0.5:
-                base_score = max(base_score, 0.85)
+            raw_base_score = 0.5 * max_cos + 0.5 * cw_recall_top3 + 0.2 * bg_recall
+            base_score = max(raw_base_score, 0.85) if is_short_grounded > 0.5 else raw_base_score
 
             p1 = ctx_sents[best_j]
             p3 = " ".join(ctx_sents[j] for j in sorted(top3_idx))
             default_pr = [0.02, 0.90, 0.08] if base_score > 0.63 else [0.80, 0.05, 0.15]
-            pr1 = nli_cache.get((p1, s), default_pr)
-            pr3 = nli_cache.get((p3, s), default_pr)
+            if is_short_grounded < 0.5 and (0.35 < raw_base_score <= max_nli_bs):
+                pr1 = nli_cache.get((p1, s), default_pr)
+                pr3 = nli_cache.get((p3, s), default_pr)
+            else:
+                pr1, pr3 = default_pr, default_pr
 
             has_unv_q = 1.0 if (q_coverage < 0.60 and bool(s_set & unverified_q_toks)) else 0.0
             p_ent_top1 = float(pr1[1])
@@ -472,7 +632,7 @@ def _extract_dir3_split_features(df: pd.DataFrame, model, nli_cache: dict) -> tu
             np.array(all_y_sent, dtype=int),
             row_sent_features,
             np.array(row_ids),
-            y_row)
+            np.array(y_row_list, dtype=int))
 
 
 def predict_supervised_multi_feature_dir3(base_dir: Path) -> list:
@@ -497,19 +657,17 @@ def predict_supervised_multi_feature_dir3(base_dir: Path) -> list:
             cache_obj = pickle.load(f)
     else:
         print("Extracting multi-level features for Train, Dev, Test (cached for next runs)...")
-        model = get_embed_model()
-        nli_cache = {}
-        nli_p = base_dir / '.nli_cache_test.pkl'
-        if nli_p.exists():
-            with open(nli_p, 'rb') as f:
-                nli_cache = pickle.load(f)
         train_df = pd.read_csv(base_dir / 'train.csv')
         dev_df = pd.read_csv(base_dir / 'dev.csv')
         test_df = pd.read_csv(base_dir / 'test.csv')
 
-        X_s_tr, y_s_tr, rows_tr, r_ids_tr, y_r_tr = _extract_dir3_split_features(train_df, model, nli_cache)
-        _, _, rows_dv, _, y_r_dv = _extract_dir3_split_features(dev_df, model, nli_cache)
-        _, _, rows_te, _, y_r_te = _extract_dir3_split_features(test_df, model, nli_cache)
+        (tr_items, dv_items, te_items), nli_cache = _prepare_dir3_splits_and_nli(
+            [train_df, dev_df, test_df], base_dir
+        )
+
+        X_s_tr, y_s_tr, rows_tr, r_ids_tr, y_r_tr = _extract_dir3_split_features(tr_items, nli_cache, max_nli_bs=0.95)
+        _, _, rows_dv, _, y_r_dv = _extract_dir3_split_features(dv_items, nli_cache, max_nli_bs=1.15)
+        _, _, rows_te, _, y_r_te = _extract_dir3_split_features(te_items, nli_cache, max_nli_bs=1.15)
         cache_obj = {
             'X_sent_train': X_s_tr, 'y_sent_train': y_s_tr,
             'rows_train': rows_tr, 'r_ids_train': r_ids_tr, 'y_row_train': y_r_tr,
@@ -572,9 +730,9 @@ def predict_supervised_multi_feature_dir3(base_dir: Path) -> list:
                 p_gbr = gbr_full.predict_proba(r)[:, 1]
             p_ens = (p_lr + p_rf + p_gbr) / 3.0
 
-            dir2_sc = r[:, 12]
-            base_sc = r[:, 7]
-            adj_dir2_sc = dir2_sc + 0.08 * (r[:, 21] * r[:, 22])
+            dir2_sc = r[:, COL_DIR2_SCORE]
+            base_sc = r[:, COL_BASE_SCORE]
+            adj_dir2_sc = dir2_sc + 0.08 * (r[:, COL_IS_LAST] * r[:, COL_IS_CLOSING])
 
             sorted_d2 = np.sort(dir2_sc)
             min_d2 = sorted_d2[0]
@@ -587,12 +745,12 @@ def predict_supervised_multi_feature_dir3(base_dir: Path) -> list:
             row_vec = [
                 min_d2, sec_min_d2, float(dir2_sc.mean()), float(adj_dir2_sc.min()),
                 float(base_sc.min()), float(base_sc.mean()),
-                float(r[:, 0].min()), float(r[:, 0].mean()),
-                float(r[:, 2].min()), float(r[:, 2].mean()),
-                float(r[:, 3].min()), float(r[:, 5].min()), float(r[:, 6].min()),
-                float(r[:, 8].min()), float(r[:, 10].max()),
-                float(r[0, 13]), float(r[0, 14]),
-                float(r[:, 16].max()), float(r[:, 17].max()),
+                float(r[:, COL_MAX_COS].min()), float(r[:, COL_MAX_COS].mean()),
+                float(r[:, COL_CW_TOP3].min()), float(r[:, COL_CW_TOP3].mean()),
+                float(r[:, COL_CW_CTX].min()), float(r[:, COL_BG_RECALL].min()), float(r[:, COL_TRI_RECALL].min()),
+                float(r[:, COL_P_ENT_MAX].min()), float(r[:, COL_P_CON_MIN].max()),
+                float(r[0, COL_Q_COV]), float(r[0, COL_Q_MAX_COS]),
+                float(r[:, COL_HAS_UNV_Q].max()), float(r[:, COL_UNV_NUM_RATIO].max()),
                 float(len(r)), float((dir2_sc <= 0.63).sum()),
                 max_p, sec_max_p, float(p_ens.mean()),
                 float(p_lr.max()), float(p_gbr.max())
@@ -606,7 +764,7 @@ def predict_supervised_multi_feature_dir3(base_dir: Path) -> list:
     X_meta_test = build_meta_features(rows_test)
 
     meta_clf = GradientBoostingClassifier(
-        n_estimators=80, max_depth=2, learning_rate=0.05, subsample=0.8, random_state=42
+        n_estimators=80, max_depth=3, learning_rate=0.03, subsample=0.9, random_state=42
     )
     meta_clf.fit(X_meta_train, y_row_train)
 
@@ -658,9 +816,11 @@ if __name__ == '__main__':
 
     cache_file = base / '.emb_cache_test.pkl'
     nli_cache_file = base / '.nli_cache_test.pkl'
-    cached_test = load_or_compute_embeddings(test, cache_file)
 
     m = args.method
+    needs_test_embs = m in ('all', 'baselines', 'new', '1', '2', '3', '4', '5', 'dir1', 'dir2')
+    cached_test = load_or_compute_embeddings(test, cache_file) if needs_test_embs else None
+
     if m in ('all', 'baselines', '1'):
         print("\n1. Running SIM-COSINE Baseline on Test set (T1 = 0.6)...")
         evaluate(y_true, predict_sim_cosine_batch(cached_test, 0.6),
